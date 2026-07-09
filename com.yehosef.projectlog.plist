@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.yehosef.projectlog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/bun</string>
+        <string>/Users/yehosef/.claude/projects-log/synth.ts</string>
+        <string>--sweep</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>1200</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/yehosef/.claude/projects-log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/Users/yehosef/.local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/yehosef</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/yehosef/.claude/logs/projectlog.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/yehosef/.claude/logs/projectlog.err.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

@@ -1,0 +1,22 @@
+# --- secrets / machine-local config (never publish) ---
+.env
+notion.json
+config.json
+ignore.json
+registry.json
+pending.json
+global-state.json
+
+# --- runtime state (per-machine, regenerated) ---
+state/
+.scratch/
+.retired/
+.last-sweep
+.lock
+.tick.lock
+*.reclaim.*
+
+# --- misc ---
+node_modules/
+*.log
+.DS_Store

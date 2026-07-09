@@ -1,0 +1,6 @@
+{
+  "code_roots": [
+    "/absolute/path/to/your/code/root",
+    "/another/code/root"
+  ]
+}

@@ -1,0 +1,5 @@
+[
+  "/private/tmp",
+  "/tmp",
+  "/path/to/dirs/whose/sessions/should/not/be/logged"
+]
