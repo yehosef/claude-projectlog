@@ -325,6 +325,29 @@ interface SynthResult {
   bullets: string[];
 }
 
+// Per-sweep LLM cost/token tally, harvested from the `claude --output-format
+// json` envelope (total_cost_usd + usage) that was previously parsed and thrown
+// away. Reset at the start of each sweep; reported on the DONE line.
+const sweepUsage = { calls: 0, costUsd: 0, inputTokens: 0, outputTokens: 0 };
+function resetSweepUsage(): void {
+  sweepUsage.calls = 0;
+  sweepUsage.costUsd = 0;
+  sweepUsage.inputTokens = 0;
+  sweepUsage.outputTokens = 0;
+}
+function recordUsage(outer: any): void {
+  if (!outer || typeof outer !== "object") return;
+  sweepUsage.calls += 1;
+  if (typeof outer.total_cost_usd === "number") sweepUsage.costUsd += outer.total_cost_usd;
+  const u = outer.usage ?? {};
+  const inTok =
+    (u.input_tokens ?? 0) +
+    (u.cache_read_input_tokens ?? 0) +
+    (u.cache_creation_input_tokens ?? 0);
+  if (typeof inTok === "number") sweepUsage.inputTokens += inTok;
+  if (typeof u.output_tokens === "number") sweepUsage.outputTokens += u.output_tokens;
+}
+
 function runClaudeSynth(digest: string): SynthResult | null {
   const prompt =
     'You are summarizing a development-session delta for a project activity log. ' +
@@ -408,6 +431,9 @@ function runClaudeSynth(digest: string): SynthResult | null {
     // Maybe no envelope (when not using --bare with subscription creds)
     outerJson = { result: stdout };
   }
+
+  // Harvest cost/token usage from the envelope (no-op if fields are absent).
+  recordUsage(outerJson);
 
   const innerRaw: string =
     outerJson?.result ?? outerJson?.content ?? outerJson?.text ?? stdout;
@@ -1148,6 +1174,7 @@ async function runSweep(dryRun: boolean): Promise<void> {
   let synced = 0;
   let failed = 0;
   let deferred = 0;
+  resetSweepUsage();
   const sweepStart = Date.now();
   console.error(
     `[sweep] START ${new Date().toISOString()} pid=${process.pid} projects=${ordered.length}`
@@ -1174,8 +1201,12 @@ async function runSweep(dryRun: boolean): Promise<void> {
   }
 
   const dur = Math.round((Date.now() - sweepStart) / 1000);
+  const cost =
+    sweepUsage.calls > 0
+      ? ` llm_calls=${sweepUsage.calls} cost=$${sweepUsage.costUsd.toFixed(4)} tok_in=${sweepUsage.inputTokens} tok_out=${sweepUsage.outputTokens}`
+      : "";
   console.error(
-    `[sweep] DONE ${dur}s synced=${synced} failed=${failed} deferred=${deferred}`
+    `[sweep] DONE ${dur}s synced=${synced} failed=${failed} deferred=${deferred}${cost}`
   );
 
   // Advance the discovery watermark ONLY after the loop completes, so an
