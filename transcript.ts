@@ -9,17 +9,26 @@ import { isIgnored, findProjectForCwd } from "./registry.ts";
 
 // Per-sweep caches. A sweep processes every project, and each project's
 // collectDelta would otherwise (a) re-walk the whole ~/.claude/projects tree,
-// (b) re-stat every file, and (c) re-read the same (often large) transcripts —
-// all O(projects × files). Caching the file list, stats, and contents for the
-// duration of one sweep makes each of those O(files) instead. The difference is
-// a multi-minute sweep vs a sub-second one. Cleared at the start of each sweep.
-let fileCache = new Map<string, Buffer>();
+// (b) re-stat every file, and (c) re-read AND re-parse the same (often large)
+// transcripts — all O(projects × files). Caching the file list, stats, and
+// PARSED tail records for the duration of one sweep makes each O(files) instead.
+// The difference is a multi-minute sweep vs a sub-second one. Cleared per sweep.
+//
+// parseCache is keyed by "path@readStart": the heavy work (read + JSON.parse +
+// text extraction + redaction) runs ONCE per file and is shared across all
+// projects (which advance through a shared file to the same offset), rather than
+// once per project. Routing/ignore filtering stays per-project (it's cheap).
+interface ParsedTail {
+  records: { cwd: string; line: string }[];
+  newOffset: number;
+}
+let parseCache = new Map<string, ParsedTail>();
 let fileListCache: string[] | null = null;
 let statCache = new Map<string, { mtimeMs: number; size: number } | null>();
 let realpathCache = new Map<string, string>();
 
 export function resetFileCache(): void {
-  fileCache = new Map();
+  parseCache = new Map();
   fileListCache = null;
   statCache = new Map();
   realpathCache = new Map();
@@ -304,16 +313,17 @@ export async function collectDelta(opts: CollectOptions): Promise<DeltaResult> {
       capped = true;
     }
 
-    // Cache is keyed by offset, NOT just path: different projects can sit at
-    // different offsets in the same shared transcript, so an offset-specific
-    // tail must never be reused for a different offset.
+    // Parse the tail ONCE per (file, offset) and cache the project-INDEPENDENT
+    // result. Projects that advance through a shared transcript reach the same
+    // offset, so they hit the same key and reuse the parse instead of each
+    // re-reading + re-JSON.parsing the same file (was O(projects × files)).
+    // Routing and ignore-list filtering are cheap and stay per-project (below).
     const cacheKey = filePath + "@" + readStart;
-    let tail: Buffer;
-    const cached = fileCache.get(cacheKey);
-    if (cached) {
-      tail = cached;
-    } else {
+    let parsed = parseCache.get(cacheKey);
+    if (!parsed) {
+      // Read only the tail [readStart, size).
       const len = st.size - readStart;
+      let tail: Buffer;
       let fd: number | null = null;
       try {
         fd = openSync(filePath, "r");
@@ -330,94 +340,99 @@ export async function collectDelta(opts: CollectOptions): Promise<DeltaResult> {
       } finally {
         if (fd !== null) { try { closeSync(fd); } catch {} }
       }
-      fileCache.set(cacheKey, tail);
-    }
 
-    if (tail.length === 0) {
-      newOffsets[filePath] = offset;
-      continue;
-    }
-
-    // Determine where the first COMPLETE line starts. When capped we began at an
-    // arbitrary byte that may split a UTF-8 character or a line, so advance to
-    // just past the first newline BYTE (0x0a) in the raw buffer — a clean line
-    // boundary. Scanning raw bytes (not the decoded string) keeps byte
-    // accounting exact even with multibyte Hebrew content.
-    let scan = tail;
-    let baseOffset = readStart;
-    if (capped) {
-      const nl = tail.indexOf(0x0a);
-      if (nl === -1) {
-        // No newline in the whole window — a single >8MB unterminated record.
-        // Nothing parseable; skip the window and re-sync on the next sweep.
-        newOffsets[filePath] = readStart + tail.length;
-        continue;
-      }
-      scan = tail.subarray(nl + 1);
-      baseOffset = readStart + nl + 1;
-    }
-
-    const raw = scan.toString("utf8");
-    const parts = raw.split("\n");
-
-    // The last element may be a partial (unterminated) line — don't consume it.
-    // Complete lines sit between newlines, so each is valid UTF-8 and its decoded
-    // byteLength equals its raw byte count exactly (no U+FFFD inflation).
-    const completeLines = parts.slice(0, -1);
-    let runningBytes = 0;
-    for (let i = 0; i < completeLines.length; i++) {
-      runningBytes += Buffer.byteLength(completeLines[i] + "\n", "utf8");
-    }
-
-    let newOffset = baseOffset + runningBytes;
-
-    // Parse complete lines
-    for (const lineStr of completeLines) {
-      const trimmed = lineStr.trim();
-      if (!trimmed) continue;
-
-      let obj: any;
-      try {
-        obj = JSON.parse(trimmed);
-      } catch {
+      if (tail.length === 0) {
+        // Short read (file truncated/rotated). Intentionally NOT cached: the
+        // offset here is this project's own `offset`, not a shareable value —
+        // a rare edge, so re-reading it for another sharer is acceptable.
+        newOffsets[filePath] = offset;
         continue;
       }
 
-      const type = obj.type as string;
-      if (type !== "user" && type !== "assistant") continue;
+      // Determine where the first COMPLETE line starts. When capped we began at
+      // an arbitrary byte that may split a UTF-8 character or a line, so advance
+      // to just past the first newline BYTE (0x0a) in the raw buffer — a clean
+      // line boundary. Scanning raw bytes (not the decoded string) keeps byte
+      // accounting exact even with multibyte Hebrew content.
+      let scan = tail;
+      let baseOffset = readStart;
+      if (capped) {
+        const nl = tail.indexOf(0x0a);
+        if (nl === -1) {
+          // No newline in the whole window — a single >8MB unterminated record.
+          // Nothing parseable; skip the window and re-sync on the next sweep.
+          newOffsets[filePath] = readStart + tail.length;
+          continue;
+        }
+        scan = tail.subarray(nl + 1);
+        baseOffset = readStart + nl + 1;
+      }
 
-      // Skip lines from synth's own spawned claude (self-feed guard)
-      // We can't directly read env from other processes, but per-line cwd routing handles it
+      const raw = scan.toString("utf8");
+      const parts = raw.split("\n");
 
-      const lineCwd: string = obj.cwd ?? "";
-      if (!lineCwd) continue;
+      // The last element may be a partial (unterminated) line — don't consume it.
+      // Complete lines sit between newlines, so each is valid UTF-8 and its
+      // decoded byteLength equals its raw byte count exactly (no U+FFFD inflation).
+      const completeLines = parts.slice(0, -1);
+      let runningBytes = 0;
+      for (let i = 0; i < completeLines.length; i++) {
+        runningBytes += Buffer.byteLength(completeLines[i] + "\n", "utf8");
+      }
 
-      // Resolve the cwd for accurate matching (cached — many lines share a cwd)
-      const resolvedLineCwd = cachedRealpath(lineCwd);
+      // Parse each complete line into a project-independent record. Only the
+      // expensive work (JSON.parse + text extraction + redaction) happens here;
+      // it is shared across every project via the cache.
+      const records: { cwd: string; line: string }[] = [];
+      for (const lineStr of completeLines) {
+        const trimmed = lineStr.trim();
+        if (!trimmed) continue;
 
-      // Check ignore list against this line's cwd
-      if (isIgnored(resolvedLineCwd, ignoreList)) continue;
+        let obj: any;
+        try {
+          obj = JSON.parse(trimmed);
+        } catch {
+          continue;
+        }
 
-      // Route this line to the project whose cwd is the longest matching prefix.
-      if (!lineBelongsToProject(resolvedLineCwd, resolvedProjectPath, resolvedOthers))
-        continue;
+        const type = obj.type as string;
+        if (type !== "user" && type !== "assistant") continue;
 
-      // Extract content
-      const message = obj.message;
-      if (!message) continue;
-      const content = message.content;
-      if (!content) continue;
+        const lineCwd: string = obj.cwd ?? "";
+        if (!lineCwd) continue;
 
-      const text = extractTextFromContent(content, type);
-      if (!text.trim()) continue;
+        const message = obj.message;
+        if (!message) continue;
+        const content = message.content;
+        if (!content) continue;
 
-      const redacted = redact(text);
-      digestLines.push(
-        `[${type.toUpperCase()} ${obj.timestamp ?? ""}] ${redacted}`
-      );
+        const text = extractTextFromContent(content, type);
+        if (!text.trim()) continue;
+
+        // Resolve cwd (cached) for routing + redact once; routing is per-project.
+        const resolvedLineCwd = cachedRealpath(lineCwd);
+        const redacted = redact(text);
+        records.push({
+          cwd: resolvedLineCwd,
+          line: `[${type.toUpperCase()} ${obj.timestamp ?? ""}] ${redacted}`,
+        });
+      }
+
+      parsed = { records, newOffset: baseOffset + runningBytes };
+      parseCache.set(cacheKey, parsed);
     }
 
-    newOffsets[filePath] = newOffset;
+    // Per-project: route each shared record to this project. These are cheap
+    // string ops (prefix checks); the ignore list is applied here so it always
+    // reflects THIS project's call even though the parse above is shared.
+    for (const rec of parsed.records) {
+      if (isIgnored(rec.cwd, ignoreList)) continue;
+      if (!lineBelongsToProject(rec.cwd, resolvedProjectPath, resolvedOthers))
+        continue;
+      digestLines.push(rec.line);
+    }
+
+    newOffsets[filePath] = parsed.newOffset;
   }
 
   // Cap total digest at ~30KB, dropping oldest lines with a note
